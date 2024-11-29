@@ -18,12 +18,13 @@ El **Reconocedor de Pokémon** es una aplicación que utiliza técnicas avanzada
 ##   **Características**
 
 - **Procesamiento de Imágenes**: Preprocesamiento y segmentación de imágenes para resaltar al Pokémon.
-- **Extracción de Características**: Obtención de características relevantes mediante momentos de Hu y descriptores de forma.
+- **Extracción de Características**: Obtención de características relevantes mediante histogramas de gradientes (HOG), momentos de Hu y histogramas de color.
 - **Clasificación con SVM**: Utilización de Máquinas de Vectores de Soporte para clasificar al Pokémon.
 - **Optimización con Algoritmos Genéticos**: Optimización de parámetros del modelo SVM utilizando la biblioteca DEAP.
 - **Lógica Borrosa**: Implementación de sistemas difusos para determinar la peligrosidad del Pokémon.
-- **Descripciones Autogeneradas**: Generación de descripciones que incluyen tipo, hábitat y peligrosidad.
+- **Descripciones Autogeneradas**: Generación de descripciones que incluyen tipo, hábitat, peligrosidad, evoluciones, rareza y más.
 - **Interfaz Gráfica**: Aplicación GUI desarrollada con Tkinter para cargar imágenes y mostrar resultados.
+- **Integración de Datasets**: Utiliza datasets de imágenes y datos para enriquecer la información presentada.
 ##   **Requisitos Previos**
 
 Antes de instalar y ejecutar la aplicación, asegúrate de tener lo siguiente:
@@ -31,12 +32,13 @@ Antes de instalar y ejecutar la aplicación, asegúrate de tener lo siguiente:
 - **Python 3.8 o superior**
 - **Conda**: Se recomienda utilizar un entorno virtual de conda.
 - **Paquetes de Python**: Las dependencias están listadas en ` requirements.txt `.
+- **Datasets**: Necesitas descargar los datasets de imágenes y CSV desde Kaggle.
 ##   **Instalación**
 
 ***1. Clonar el Repositorio***
 
  ```bash
-    git clone https://github.com/tu_usuario/proyecto_pokemon.git cd proyecto_pokemon
+    git clone https://github.com/jorgescu/Pokemon-Recognizer.git cd proyecto_pokemon
  ```
 ***2. Crear y Activar el Entorno Virtual***
 
@@ -74,8 +76,7 @@ Para iniciar la interfaz gráfica de usuario:
 ##   **Estructura del Proyecto**
 
  ``` 
- proyecto_pokemon/
-│
+proyecto_pokemon/
 ├── src/
 │   ├── __init__.py
 │   ├── preprocesamiento.py
@@ -85,20 +86,25 @@ Para iniciar la interfaz gráfica de usuario:
 │   ├── optimizacion.py
 │   ├── logica_borrosa.py
 │   ├── descripciones.py
+│   ├── entrenamiento.py        # Script para entrenar el modelo
 │   └── interfaz.py
 │
 ├── data/
-│   ├── raw/                 # Imágenes originales
-│   ├── processed/           # Imágenes y datos procesados
-│   └── models/              # Modelos entrenados
+│   ├── images/
+│       └── pokemon-images/     # Imágenes de Pokémon nombradas por número de Pokédex
+│   ├── csv/
+│       └── pokemon.csv         # Datos de Pokémon
+│   └── models/
+│       ├── modelo_svm.pkl      # Modelo SVM entrenado
+│       └── label_encoder.pkl   # Codificador de etiquetas
 │
-├── notebooks/               # Cuadernos Jupyter para exploración
+├── notebooks/                  # Cuadernos Jupyter para exploración
 │   └── exploracion.ipynb
 │
-├── requirements.txt         # Dependencias del proyecto
-├── main.py                  # Script principal
-├── README.md                # Descripción del proyecto
-└── .gitignore               # Archivos y carpetas ignorados en Git
+├── requirements.txt            # Dependencias del proyecto
+├── main.py                     # Script principal
+├── README.md                   # Descripción del proyecto
+└── .gitignore                  # Archivos y carpetas ignorados en Git
 ```
 
 ##   **Contribuciones**
@@ -110,15 +116,7 @@ Crea una **rama** para tu funcionalidad o corrección de errores (` git checkout
 **Confirma** tus cambios (` git commit -m 'Agrega nueva función' `).
 **Envía** a la rama (` git push origin feature/nueva-funcion `).
 Abre un **Pull Request**.
-##   **Licencia**
 
-Este proyecto está licenciado bajo la **Licencia MIT**. Consulta el archivo [ LICENSE ] para obtener más detalles.
-
-##   **Contacto**
-
-- **Autor**: Tu Nombre
-- **Correo Electrónico**: tuemail@example.com
-- **LinkedIn**: [ Tu Perfil ]( https://www.linkedin.com/in/tuperfil )
 ##   **Agradecimientos**
 
 - **Bibliotecas y Herramientas**: Agradecimiento a las bibliotecas de código abierto utilizadas en este proyecto, como OpenCV, scikit-learn, DEAP, scikit-fuzzy, entre otras.
