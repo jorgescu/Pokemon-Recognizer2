@@ -1,0 +1,14 @@
+# Entornos virtuales
+env/
+venv/
+*.pyc
+__pycache__/
+
+# Archivos de datos y modelos
+data/raw/
+data/processed/
+data/models/
+
+# Archivos temporales y de entorno
+.DS_Store
+.idea/
