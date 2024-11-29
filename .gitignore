@@ -8,6 +8,8 @@ __pycache__/
 data/raw/
 data/processed/
 data/models/
+data/images/pokemon-images
+data/csv
 
 # Archivos temporales y de entorno
 .DS_Store

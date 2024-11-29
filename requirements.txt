@@ -7,3 +7,5 @@ deap
 scikit-fuzzy
 Pillow
 scipy
+kagglehub
+pandas
