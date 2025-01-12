@@ -1,0 +1,1278 @@
+# Proyecto Reconocedor de Pokémon - Todos los archivos
+# ---------------------------------------------------
+
+===== [Fichero] main.py (Script principal (punto de entrada)) =====
+
+import os
+import tkinter as tk
+from src import gui
+from src.data_manager import DataManager
+from src.classification import PokemonClassifier
+from src.description_generation import DescriptionGenerator
+from src.fuzzy_logic import FuzzyDangerEvaluator
+from src.extras import ExtrasManager
+from src.feature_extraction import FeatureExtractor
+from src.image_processing import ImagePreprocessor
+from src.knowledge_manager import KnowledgeManager
+from src.virtual_environment import VirtualEnvironmentIntegrator
+
+
+def main():
+    # Ruta de datos
+    data_path = os.path.join("data", "csv", "pokemon.csv")
+    images_path = os.path.join("data", "images", "pokemon-images")
+
+    # Carga de datos
+    data_mgr = DataManager(data_path)
+    df = data_mgr.load_data()
+
+    # Inicialización de componentes
+    classifier = PokemonClassifier(model_path="models/svm_model.pkl", data=df)
+    extractor = FeatureExtractor()
+    preprocessor = ImagePreprocessor()
+    danger_evaluator = FuzzyDangerEvaluator()
+    desc_generator = DescriptionGenerator(df)
+    extras_mgr = ExtrasManager(df)
+    knowledge_mgr = KnowledgeManager(df)
+    vr_integration = VirtualEnvironmentIntegrator()
+
+    # Construcción de la GUI principal
+    root = tk.Tk()
+    app = gui.App(
+        master=root,
+        classifier=classifier,
+        extractor=extractor,
+        preprocessor=preprocessor,
+        danger_evaluator=danger_evaluator,
+        desc_generator=desc_generator,
+        extras_manager=extras_mgr,
+        knowledge_manager=knowledge_mgr,
+        vr_integration=vr_integration,
+        images_path=images_path,
+        df_pokemon=df  # Pasar el DataFrame a la GUI
+    )
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
+
+
+===== [Fichero] train.py (Script de entrenamiento SVM) =====
+
+# train.py
+
+"""
+Script para entrenar un modelo SVM que reconozca Pokémon a partir de imágenes.
+1) Reescribe las imágenes en disco sin perfiles ICC usando Pillow.
+2) Luego, construye el dataset usando OpenCV y scikit-image.
+3) Entrena y guarda un modelo SVM.
+"""
+
+import os
+import pickle
+import numpy as np
+import pandas as pd
+import cv2
+import warnings
+import re  # Importación añadida para manejar expresiones regulares
+
+from PIL import Image
+
+from skimage.color import rgb2gray
+from skimage.feature import hog
+from sklearn.svm import SVC
+from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
+from collections import Counter
+
+
+def remove_icc_profiles_in_place(images_path):
+    """
+    Recorre 'images_path' y para cada .png/.jpg, lo reescribe en disco
+    sin perfiles ICC usando Pillow. Así se evitan los libpng warnings.
+    """
+    valid_extensions = (".png", ".jpg", ".jpeg")
+    image_files = os.listdir(images_path)
+
+    print(f"Eliminando perfiles ICC directamente en disco dentro de {images_path}...")
+    for file_name in image_files:
+        if file_name.lower().endswith(valid_extensions):
+            file_path = os.path.join(images_path, file_name)
+            try:
+                with Image.open(file_path) as pil_img:
+                    # Convertir a RGB para eliminar perfiles y metadatos
+                    pil_img = pil_img.convert("RGB")
+
+                    # Sobrescribir el archivo sin perfiles ICC
+                    pil_img.save(file_path, optimize=True, icc_profile=None)
+            except Exception as e:
+                print(f"No se pudo limpiar {file_name}: {e}")
+
+
+def remove_icc_profiles_with_opencv(images_path):
+    """
+    Alternativa: Reescribe las imágenes usando OpenCV para eliminar perfiles ICC.
+    """
+    valid_extensions = (".png", ".jpg", ".jpeg")
+    image_files = os.listdir(images_path)
+
+    print(f"Eliminando perfiles ICC directamente en disco dentro de {images_path} usando OpenCV...")
+    for file_name in image_files:
+        if file_name.lower().endswith(valid_extensions):
+            file_path = os.path.join(images_path, file_name)
+            try:
+                img = cv2.imread(file_path)
+                if img is not None:
+                    # Para PNG, puedes especificar la compresión si lo deseas
+                    if file_name.lower().endswith(".png"):
+                        cv2.imwrite(file_path, img, [int(cv2.IMWRITE_PNG_COMPRESSION), 9])
+                    else:
+                        cv2.imwrite(file_path, img)
+            except Exception as e:
+                print(f"No se pudo limpiar {file_name}: {e}")
+
+
+def check_icc_profile(image_path):
+    """
+    Verifica si una imagen contiene un perfil ICC.
+    """
+    with Image.open(image_path) as img:
+        icc = img.info.get('icc_profile')
+        if icc:
+            print(f"{image_path} contiene un perfil ICC.")
+            return True
+        else:
+            print(f"{image_path} no contiene un perfil ICC.")
+            return False
+
+
+def load_pokemon_csv(csv_path):
+    """
+    Carga el CSV con información de Pokémon.
+    Retorna un DataFrame de pandas.
+    """
+    df = pd.read_csv(csv_path)
+    return df
+
+
+def preprocess_image(img, size=(128, 128)):
+    """
+    Preprocesa la imagen:
+      1. Redimensiona a 'size'.
+      2. Convierte de BGR a RGB.
+      3. Normaliza a rango [0,1].
+    Retorna la imagen procesada (numpy array).
+    """
+    img_resized = cv2.resize(img, size)
+    img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
+    img_norm = img_rgb / 255.0
+    return img_norm
+
+
+def extract_features(img):
+    """
+    Extrae características de la imagen:
+      - HOG (skimage, sobre escala de grises)
+      - Histograma de color (simple en 3 canales)
+    Retorna un vector con las características concatenadas.
+    """
+    # Convertir a gris
+    gray = rgb2gray(img)
+
+    # HOG features
+    hog_features = hog(
+        gray,
+        orientations=8,
+        pixels_per_cell=(16, 16),
+        cells_per_block=(1, 1),
+        visualize=False
+    )
+
+    # Histograma de color (3 canales)
+    hist_r, _ = np.histogram(img[:, :, 0], bins=16, range=(0, 1))
+    hist_g, _ = np.histogram(img[:, :, 1], bins=16, range=(0, 1))
+    hist_b, _ = np.histogram(img[:, :, 2], bins=16, range=(0, 1))
+
+    # Concatenar
+    features = np.concatenate([hog_features, hist_r, hist_g, hist_b])
+    return features
+
+
+def extract_pokedex_num(file_name):
+    """
+    Extrae el número de Pokédex del nombre del archivo.
+    Permite nombres como '001.png', '001_1.png', '001a.png', etc.
+    Retorna el número como entero o None si no se puede extraer.
+    """
+    match = re.match(r'^(\d+)', file_name)
+    if match:
+        return int(match.group(1))
+    else:
+        return None
+
+
+def build_dataset(images_path, df_pokemon):
+    """
+    Recorre el directorio 'images_path', para cada imagen .png/.jpg:
+      - Extrae el pokedex_number del nombre de archivo.
+      - Verifica si está en df_pokemon (opcional).
+      - Lee con OpenCV.
+      - Preprocesa y extrae características.
+    Retorna X (lista de vectores) y y (lista de pokedex_number).
+    """
+    X = []
+    y = []
+
+    valid_extensions = (".png", ".jpg", ".jpeg")
+    image_files = os.listdir(images_path)
+
+    for file_name in image_files:
+        if file_name.lower().endswith(valid_extensions):
+            pokedex_num = extract_pokedex_num(file_name)
+            if pokedex_num is None:
+                print(f"Archivo {file_name} no se reconoce como pokedex_number válido.")
+                continue
+
+            # (Opcional) Verificar si existe en CSV
+            if pokedex_num not in df_pokemon["pokedex_number"].values:
+                print(f"Advertencia: El pokedex_number {pokedex_num} no está en pokemon.csv.")
+                continue
+
+            file_path = os.path.join(images_path, file_name)
+            img_cv2 = cv2.imread(file_path)
+            if img_cv2 is None:
+                print(f"No se pudo leer la imagen {file_path}. Se ignora.")
+                continue
+
+            # Preprocesar
+            img_preprocessed = preprocess_image(img_cv2)
+            # Extraer features
+            features = extract_features(img_preprocessed)
+
+            X.append(features)
+            y.append(pokedex_num)
+
+    X = np.array(X)
+    y = np.array(y)
+    return X, y
+
+
+def train_svm(X, y, test_size=0.2, random_state=42, c_val=1.0, gamma_val='scale'):
+    """
+    Entrena un clasificador SVM con los datos X, y.
+    Hace un split train/test y retorna el modelo y su accuracy en test.
+    """
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y,
+        test_size=test_size,
+        random_state=random_state,
+        stratify=y
+    )
+
+    model = SVC(C=c_val, gamma=gamma_val, probability=True)
+    model.fit(X_train, y_train)
+    test_acc = model.score(X_test, y_test)
+    return model, test_acc
+
+
+def cross_validation_score_func(X, y, model=None, cv=5):
+    """
+    Aplica cross-validation con K folds y retorna el accuracy promedio.
+    """
+    if model is None:
+        model = SVC(probability=True)
+    scores = cross_val_score(model, X, y, cv=cv)
+    return scores.mean()
+
+
+def print_class_distribution(y):
+    """
+    Imprime la distribución de clases en el conjunto de etiquetas y.
+    """
+    counter = Counter(y)
+    print("\nDistribución de clases:")
+    for cls, count in sorted(counter.items()):
+        print(f"Clase {cls}: {count} muestras")
+    return counter
+
+
+def main():
+    # Ajustar rutas a tu estructura
+    csv_path = os.path.join("data", "csv", "pokemon.csv")
+    images_path = os.path.join("data", "images", "pokemon-images-augmented")
+    model_path = os.path.join("models", "svm_model.pkl")
+
+    # 1) Eliminar perfiles ICC en disco (in-place) para todas las imágenes usando Pillow
+    remove_icc_profiles_in_place(images_path)
+
+    # Opcional: Si las advertencias persisten, utiliza la alternativa con OpenCV
+    # remove_icc_profiles_with_opencv(images_path)
+
+    # 1.1) Verificar que las imágenes no contienen perfiles ICC
+    print("\nVerificando eliminación de perfiles ICC...")
+    sample_images = os.listdir(images_path)[:5]  # Verificar las primeras 5 imágenes
+    for file_name in sample_images:
+        if file_name.lower().endswith((".png", ".jpg", ".jpeg")):
+            file_path = os.path.join(images_path, file_name)
+            check_icc_profile(file_path)
+
+    # 2) Cargar CSV
+    print("\nCargando CSV de Pokémon...")
+    df_pokemon = load_pokemon_csv(csv_path)
+
+    # 3) Construir dataset
+    print("\nConstruyendo dataset de imágenes...")
+    X, y = build_dataset(images_path, df_pokemon)
+    print(f"Total de muestras cargadas: {len(X)}")
+    if len(X) == 0:
+        print("No se encontraron imágenes válidas para entrenar.")
+        return
+
+    # 3.1) Imprimir distribución de clases
+    class_counts = print_class_distribution(y)
+
+    # 4) Determinar el número adecuado de folds para cross-validation
+    min_samples_per_class = min(class_counts.values())
+    desired_cv = 5
+    if min_samples_per_class < desired_cv:
+        if min_samples_per_class < 2:
+            print(f"\nError: La clase con menos muestras tiene {min_samples_per_class} muestras. "
+                  f"Es necesario tener al menos 2 muestras por clase para la validación cruzada.")
+            print("Considera recolectar más imágenes por clase o eliminar clases con pocas muestras.")
+            return
+        else:
+            cv_folds = min_samples_per_class
+            print(f"\nAdvertencia: La clase con menos muestras tiene {min_samples_per_class} muestras. "
+                  f"Reduciendo el número de folds de {desired_cv} a {cv_folds}.")
+    else:
+        cv_folds = desired_cv
+
+    # 5) Cross-Validation sencilla para ver un accuracy de base
+    print(f"\nEvaluando modelo base con Cross-Validation ({cv_folds} folds)...")
+    base_cv_score = cross_validation_score_func(X, y, model=SVC(probability=True), cv=cv_folds)
+    print(f"Accuracy promedio (SVC default) = {base_cv_score:.2f}")
+
+    # 6) Entrenar con train/test split
+    print("\nEntrenando modelo final SVM con train/test split...")
+    model, test_acc = train_svm(X, y, test_size=0.2, random_state=42)
+    print(f"Exactitud en test: {test_acc:.2f}")
+
+    # 7) Guardar modelo entrenado
+    print(f"\nGuardando modelo en {model_path} ...")
+    os.makedirs(os.path.dirname(model_path), exist_ok=True)
+    with open(model_path, "wb") as f:
+        pickle.dump(model, f)
+
+    print("\nEntrenamiento completado con éxito.")
+
+
+if __name__ == "__main__":
+    # Opcional: Suprimir advertencias específicas de libpng si persisten
+    warnings.filterwarnings("ignore", message=".*libpng warning: iCCP: known incorrect sRGB profile.*")
+    main()
+
+
+===== [Fichero] augment_data.py (Script de data augmentation (opcional)) =====
+
+# augment_data.py
+
+import os
+import cv2
+import numpy as np
+
+def augment_image(img):
+    """
+    Aplica varias transformaciones para crear versiones distintas:
+    - Giro 90°, 180°, 270°
+    - Espejo horizontal
+    - Espejo vertical
+    - (Opcional: añadir ruido, cambio de brillo, etc.)
+    Retorna una lista de imágenes transformadas (arrays).
+    """
+    augmented = []
+
+    # Original (la primera la puedes omitir si no quieres duplicar sin cambio)
+    # augmented.append(img)
+
+    # Giro 90
+    rot90 = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+    augmented.append(rot90)
+
+    # Giro 180
+    rot180 = cv2.rotate(img, cv2.ROTATE_180)
+    augmented.append(rot180)
+
+    # Giro 270
+    rot270 = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    augmented.append(rot270)
+
+    # Flip horizontal
+    flip_h = cv2.flip(img, 1)  # 1: flip horizontal
+    augmented.append(flip_h)
+
+    # Flip vertical
+    flip_v = cv2.flip(img, 0)  # 0: flip vertical
+    augmented.append(flip_v)
+
+    # (Opcional) Agregar otras transformaciones:
+    # - Ruido aleatorio, cambio de brillo, etc.
+
+    return augmented
+
+def main():
+    # Carpeta de imágenes originales
+    original_folder = os.path.join("data", "images", "pokemon-images")
+    # Carpeta de destino para imágenes aumentadas
+    augmented_folder = os.path.join("data", "images", "pokemon-images-augmented")
+
+    os.makedirs(augmented_folder, exist_ok=True)
+
+    valid_extensions = (".png", ".jpg", ".jpeg")
+
+    # Recorremos todos los archivos
+    for file_name in os.listdir(original_folder):
+        file_lower = file_name.lower()
+        if file_lower.endswith(valid_extensions):
+            file_path = os.path.join(original_folder, file_name)
+            # Leer imagen con OpenCV
+            img = cv2.imread(file_path)
+            if img is None:
+                print(f"No se pudo leer {file_name}. Ignorando.")
+                continue
+
+            # Generar versiones aumentadas
+            aug_imgs = augment_image(img)
+
+            # Guardar la imagen original en la carpeta nueva (opcional)
+            # para que también quede copiada allí:
+            # cv2.imwrite(os.path.join(augmented_folder, file_name), img)
+
+            # Guardar versiones aumentadas
+            base_name, ext = os.path.splitext(file_name)
+            for idx, aug_img in enumerate(aug_imgs, start=1):
+                new_name = f"{base_name}_aug{idx}{ext}"
+                save_path = os.path.join(augmented_folder, new_name)
+                cv2.imwrite(save_path, aug_img)
+                print(f"Guardada: {new_name}")
+
+if __name__ == "__main__":
+    main()
+
+
+===== [Fichero] requirements.txt (Lista de dependencias del proyecto) =====
+
+opencv-python
+scikit-learn
+scikit-image
+scikit-fuzzy
+pandas
+numpy
+matplotlib
+pillow
+fuzzywuzzy
+python-levenshtein
+requests
+folium
+plotly
+tensorflow
+pygments
+tk
+tkhtmlview
+
+
+===== [Fichero] src/classification.py (Módulo con la clase PokemonClassifier (SVM)) =====
+
+import pickle
+from sklearn.svm import SVC
+
+class PokemonClassifier:
+    def __init__(self, model_path=None, data=None):
+        self.model_path = model_path
+        self.data = data
+        self.model = self._load_model()
+
+    def _load_model(self):
+        """
+        Carga un modelo SVM. (Aprendizaje automático, Reconocimiento de Patrones).
+        """
+        try:
+            with open(self.model_path, 'rb') as f:
+                model = pickle.load(f)
+            return model
+        except:
+            # Si no existe el modelo, se crea uno vacío.
+            return SVC(probability=True)
+
+    def predict(self, features):
+        """
+        Predice el Pokémon a partir de las características extraídas.
+        """
+        prediction = self.model.predict([features])[0]
+        return prediction
+
+
+===== [Fichero] src/data_manager.py (Carga del CSV de Pokémon) =====
+
+import pandas as pd
+
+
+class DataManager:
+    def __init__(self, csv_path):
+        self.csv_path = csv_path
+
+    def load_data(self):
+        """
+        Carga el DataFrame con información de Pokémon.
+        Representación del conocimiento: aquí pasamos de datos brutos (CSV) a información estructurada (DataFrame).
+        """
+        df = pd.read_csv(self.csv_path)
+        return df
+
+
+===== [Fichero] src/feature_extraction.py (Extracción de características (HOG, hist. color)) =====
+
+import numpy as np
+from skimage.feature import hog
+from skimage.color import rgb2gray
+
+
+class FeatureExtractor:
+    def __init__(self):
+        pass
+
+    def extract_features(self, img):
+        """
+        Extracción de características (Reconocimiento de Patrones).
+        Se extraen características HOG + histograma de color.
+        """
+        # Convertir a gris
+        gray = rgb2gray(img)
+
+        # HOG en imagen 2D (gray)
+        hog_features, _ = hog(
+            gray,
+            orientations=8,
+            pixels_per_cell=(16, 16),
+            cells_per_block=(1, 1),
+            visualize=True
+            # Se elimina channel_axis porque gray ya es 2D
+        )
+
+        # Histogramas de color en la imagen original (3D)
+        hist_r, _ = np.histogram(img[:, :, 0], bins=16, range=(0, 1))
+        hist_g, _ = np.histogram(img[:, :, 1], bins=16, range=(0, 1))
+        hist_b, _ = np.histogram(img[:, :, 2], bins=16, range=(0, 1))
+
+        # Concatenar las características
+        features = np.concatenate([hog_features, hist_r, hist_g, hist_b])
+        return features
+
+
+===== [Fichero] src/fuzzy_logic.py (Módulo de lógica borrosa para peligrosidad) =====
+
+import numpy as np
+import skfuzzy as fuzz
+import skfuzzy.control as ctrl
+
+
+class FuzzyDangerEvaluator:
+    def __init__(self):
+        """
+        Lógica borrosa para estimar la peligrosidad. (Lógica Borrosa)
+        """
+        self.attack = ctrl.Antecedent(np.arange(0, 201, 1), 'attack')
+        self.defense = ctrl.Antecedent(np.arange(0, 201, 1), 'defense')
+        self.danger = ctrl.Consequent(np.arange(0, 101, 1), 'danger')
+
+        self.attack['low'] = fuzz.trapmf(self.attack.universe, [0, 0, 50, 80])
+        self.attack['medium'] = fuzz.trimf(self.attack.universe, [50, 100, 150])
+        self.attack['high'] = fuzz.trapmf(self.attack.universe, [120, 150, 200, 200])
+
+        self.defense['low'] = fuzz.trapmf(self.defense.universe, [0, 0, 50, 80])
+        self.defense['medium'] = fuzz.trimf(self.defense.universe, [50, 100, 150])
+        self.defense['high'] = fuzz.trapmf(self.defense.universe, [120, 150, 200, 200])
+
+        self.danger['low'] = fuzz.trimf(self.danger.universe, [0, 25, 50])
+        self.danger['medium'] = fuzz.trimf(self.danger.universe, [30, 50, 70])
+        self.danger['high'] = fuzz.trimf(self.danger.universe, [60, 80, 100])
+
+        rule1 = ctrl.Rule(self.attack['low'] & self.defense['low'], self.danger['low'])
+        rule2 = ctrl.Rule(
+            (self.attack['medium'] | self.defense['medium']) & ~((self.attack['high'] & self.defense['high'])),
+            self.danger['medium'])
+        rule3 = ctrl.Rule(self.attack['high'] & self.defense['high'], self.danger['high'])
+
+        system = ctrl.ControlSystem([rule1, rule2, rule3])
+        self.sim = ctrl.ControlSystemSimulation(system)
+
+    def evaluate(self, attack_val, defense_val):
+        self.sim.input['attack'] = attack_val
+        self.sim.input['defense'] = defense_val
+        self.sim.compute()
+        return self.sim.output['danger']
+
+
+===== [Fichero] src/description_generation.py (Genera descripción textual del Pokémon) =====
+
+import numpy as np
+import pandas as pd
+
+
+class DescriptionGenerator:
+    def __init__(self, df):
+        self.df = df
+
+    def generate_description(self, pokedex_number, danger_score):
+        """
+        Genera una descripción detallada del Pokémon. (Representación del conocimiento a partir de datos).
+        """
+        poke_data = self.df[self.df['pokedex_number'] == pokedex_number].iloc[0]
+
+        name = poke_data['name']
+        ptype1 = poke_data['type1']
+        ptype2 = poke_data['type2'] if not pd.isna(poke_data['type2']) else None
+        classification = poke_data['classfication']
+        attack = poke_data['attack']
+        defense = poke_data['defense']
+        sp_attack = poke_data['sp_attack']
+        sp_defense = poke_data['sp_defense']
+        speed = poke_data['speed']
+
+        base_total = poke_data['base_total']
+        if base_total < 400:
+            rarity = "común"
+        elif base_total < 500:
+            rarity = "poco común"
+        else:
+            rarity = "raro"
+
+        if danger_score < 30:
+            danger_level = "baja"
+        elif danger_score < 60:
+            danger_level = "moderada"
+        else:
+            danger_level = "alta"
+
+        # Simular evoluciones: asume línea evolutiva ordenada por número de pokédex
+        evolution_line = self.df[
+            self.df['japanese_name'].str.contains(poke_data['japanese_name'].split('フ')[0], na=False)]
+        evolution_numbers = evolution_line['pokedex_number'].tolist()
+        evolution_numbers.sort()
+        current_index = evolution_numbers.index(pokedex_number)
+        next_evo = None
+        if current_index < len(evolution_numbers) - 1:
+            next_evo = self.df[self.df['pokedex_number'] == evolution_numbers[current_index + 1]].iloc[0]['name']
+        evo_text = f"Evoluciona a {next_evo}" if next_evo else "No tiene evoluciones posteriores."
+
+        ttext = ptype1 if ptype2 is None else f"{ptype1} / {ptype2}"
+
+        description = (
+            f"¡Has identificado a {name} (N.° {pokedex_number})!\n"
+            f"Tipo: {ttext}\n"
+            f"Clasificación: {classification}\n"
+            f"Nivel de rareza: {rarity}\n"
+            f"Evolución: {evo_text}\n"
+            f"Nivel de peligrosidad (Lógica Borrosa): {danger_level}\n"
+            f"Estadísticas:\n"
+            f" - Ataque: {attack}\n"
+            f" - Defensa: {defense}\n"
+            f" - Ataque Especial: {sp_attack}\n"
+            f" - Defensa Especial: {sp_defense}\n"
+            f" - Velocidad: {speed}\n"
+        )
+        return description
+
+
+===== [Fichero] src/knowledge_manager.py (Gestor de conocimiento/QA simple) =====
+
+from fuzzywuzzy import process
+
+class KnowledgeManager:
+    def __init__(self, df):
+        """
+        Representación del Conocimiento. Pequeño motor de QA.
+        Esto es un ejemplo de cómo podríamos relacionar las preguntas del usuario con respuestas.
+        """
+        self.df = df
+        # Conocimientos simples (podría ser base de hechos/reglas)
+        self.knowledge_base = {
+            "¿Qué es un Pokémon?": "Un Pokémon es una criatura ficticia que aparece en la franquicia Pokémon.",
+            "¿Cuál es el Pokémon número 1?": "El Pokémon número 1 es Bulbasaur.",
+            "¿Qué tipo de Pokémon es Bulbasaur?": "Bulbasaur es de tipo Grass/Poison.",
+            "¿Qué es la lógica borrosa?": "La lógica borrosa es una forma de razonar que permite valores de verdad parciales, "
+                                         "utilizada para manejar la incertidumbre.",
+            "¿Qué es un Algoritmo Evolutivo?": "Un Algoritmo Evolutivo es un tipo de metaheurística inspirada en la evolución natural.",
+            "¿Qué es el Test de Turing?": "El Test de Turing es una prueba para determinar si una máquina puede exhibir comportamiento inteligente indistinguible del de un humano.",
+            "¿Cómo se reconoce un Pokémon a partir de una imagen?": "Se pueden extraer características visuales (HOG, color) y usar un clasificador entrenado (p.ej. SVM).",
+            "¿Qué es la Percepción Computacional?": "La percepción computacional es la capacidad de un sistema para interpretar datos sensoriales (imágenes, sonidos) y generar información útil."
+        }
+
+    def answer_question(self, question):
+        """
+        Usa fuzzy matching para encontrar la pregunta más similar en la base de conocimiento.
+        """
+        keys = list(self.knowledge_base.keys())
+        best_match, score = process.extractOne(question, keys)
+        if score > 60:
+            return self.knowledge_base[best_match]
+        else:
+            return "No estoy seguro de la respuesta, intenta otra pregunta."
+
+
+===== [Fichero] src/extras.py (Funciones extra (recomendaciones, noticias...)) =====
+
+# src/extras.py
+
+import folium
+import pandas as pd
+from folium.plugins import MarkerCluster
+import random
+import tempfile
+import os
+
+class ExtrasManager:
+    def __init__(self, df):
+        self.df = df
+        # Definir coordenadas base para cada generación (ficticias)
+        self.generation_coordinates = {
+            1: {"lat": 35.6895, "lon": 139.6917},  # Tokyo, Japón
+            2: {"lat": 34.0522, "lon": -118.2437},  # Los Ángeles, USA
+            3: {"lat": 51.5074, "lon": -0.1278},  # Londres, Reino Unido
+            4: {"lat": 48.8566, "lon": 2.3522},  # París, Francia
+            5: {"lat": 40.7128, "lon": -74.0060},  # Nueva York, USA
+            6: {"lat": 55.7558, "lon": 37.6173},  # Moscú, Rusia
+            7: {"lat": -33.8688, "lon": 151.2093},  # Sídney, Australia
+            8: {"lat": 19.4326, "lon": -99.1332},  # Ciudad de México, México
+            # Añadir más generaciones si es necesario
+        }
+
+    def get_habitat_map(self, pokedex_number):
+        # Filtrar el Pokémon por número de Pokédex
+        poke_data = self.df[self.df['pokedex_number'] == pokedex_number]
+        if poke_data.empty:
+            raise ValueError(f"No se encontró el Pokémon con número de Pokédex {pokedex_number}.")
+
+        poke_data = poke_data.iloc[0]
+
+        generation = poke_data['generation']
+        name = poke_data['name']
+        ptype1 = poke_data['type1']
+        ptype2 = poke_data['type2'] if pd.notna(poke_data['type2']) else "N/A"
+        classification = poke_data['classfication']
+        height = poke_data['height_m']
+        weight = poke_data['weight_kg']
+        is_legendary = poke_data['is_legendary']
+
+        # Obtener coordenadas base según generación
+        if generation in self.generation_coordinates:
+            base_lat = self.generation_coordinates[generation]['lat']
+            base_lon = self.generation_coordinates[generation]['lon']
+        else:
+            # Coordenadas aleatorias si la generación no está definida
+            base_lat = random.uniform(-90, 90)
+            base_lon = random.uniform(-180, 180)
+
+        # Simular múltiples hábitats por Pokémon
+        num_habitats = random.randint(1, 3)  # 1 a 3 hábitats
+        habitat_coords = []
+        for _ in range(num_habitats):
+            # Desplazamiento aleatorio para simular diferentes hábitats
+            lat_offset = random.uniform(-5, 5)
+            lon_offset = random.uniform(-5, 5)
+            habitat_coords.append((base_lat + lat_offset, base_lon + lon_offset))
+
+        # Crear el mapa centrado en la primera ubicación
+        m = folium.Map(location=habitat_coords[0], zoom_start=5, tiles='OpenStreetMap', control_scale=True)
+
+        # Añadir un cluster de marcadores para mayor eficiencia
+        marker_cluster = MarkerCluster().add_to(m)
+
+        for idx, (lat, lon) in enumerate(habitat_coords, start=1):
+            popup_content = f"""
+            <b>{name} (N.° {pokedex_number})</b><br>
+            <b>Tipo:</b> {ptype1} / {ptype2}<br>
+            <b>Clasificación:</b> {classification}<br>
+            <b>Altura:</b> {height} m<br>
+            <b>Peso:</b> {weight} kg<br>
+            <b>Legendario:</b> {"Sí" if is_legendary else "No"}<br>
+            <b>Hábitat {idx}:</b> Latitud {lat:.4f}, Longitud {lon:.4f}
+            """
+            folium.Marker(
+                location=(lat, lon),
+                popup=folium.Popup(popup_content, max_width=300),
+                icon=folium.Icon(color='red' if is_legendary else 'blue', icon='info-sign')
+            ).add_to(marker_cluster)
+
+        # Añadir capas de tile con atribución adecuada
+        folium.TileLayer(
+            tiles='Stamen Terrain',
+            name='Stamen Terrain',
+            attr='Map tiles by Stamen Design, CC BY 3.0 — Map data © OpenStreetMap contributors'
+        ).add_to(m)
+
+        folium.TileLayer(
+            tiles='Stamen Toner',
+            name='Stamen Toner',
+            attr='Map tiles by Stamen Design, CC BY 3.0 — Map data © OpenStreetMap contributors'
+        ).add_to(m)
+
+        folium.TileLayer(
+            tiles='Stamen Watercolor',
+            name='Stamen Watercolor',
+            attr='Map tiles by Stamen Design, CC BY 3.0 — Map data © OpenStreetMap contributors'
+        ).add_to(m)
+
+        # Añadir control de capas
+        folium.LayerControl().add_to(m)
+
+        # Guardar el mapa en un archivo HTML temporal
+        temp_dir = tempfile.gettempdir()
+        map_file = os.path.join(temp_dir, f'pokemon_{pokedex_number}_habitat_map.html')
+        m.save(map_file)
+
+        return map_file
+
+    def get_recommendations(self, pokedex_number):
+        # Recomendaciones simples: Pokémon con tipo similar
+        poke_data = self.df[self.df['pokedex_number'] == pokedex_number].iloc[0]
+        same_type = self.df[self.df['type1'] == poke_data['type1']]
+        if pd.notna(poke_data['type2']):
+            same_type = same_type[same_type['type2'] == poke_data['type2']]
+        recommended = same_type.sample(min(5, len(same_type)))['name'].tolist()
+        return recommended
+
+    def get_news(self):
+        # Noticias falsas (placeholder)
+        return [
+            " "
+        ]
+
+
+===== [Fichero] src/virtual_environment.py (Simulación de entorno virtual 3D) =====
+
+class VirtualEnvironmentIntegrator:
+    def __init__(self):
+        """
+        Integración con entornos virtuales en 3D (Realidad física, aumentada, virtual y mixta).
+        Aquí sólo simulamos la idea: en un entorno real podríamos usar SDKs de Unity o OpenSim.
+        """
+        pass
+
+    def place_pokemon_in_virtual_world(self, pokedex_number):
+        """
+        Coloca un Pokémon en un entorno virtual 3D. Aquí es solo un print (mock).
+        En un caso real, habría APIs para comunicarse con Unity3D/OpenSim.
+        """
+        print(f"Colocando Pokémon N.º {pokedex_number} en el entorno virtual 3D...")
+        return "Pokémon colocado en el entorno virtual."
+
+
+===== [Fichero] src/gui.py (Interfaz gráfica Tkinter) =====
+
+# src/gui.py
+
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+from PIL import Image, ImageTk
+import os
+import webbrowser
+import tempfile
+from src.battle_simulator import BattleSimulator  # Importar el módulo de simulación
+import pandas as pd
+
+class App(tk.Frame):
+    def __init__(self, master, classifier, extractor, preprocessor, danger_evaluator, desc_generator, extras_manager,
+                 knowledge_manager, vr_integration, images_path, df_pokemon):
+        super().__init__(master)
+        self.master = master
+        self.classifier = classifier
+        self.extractor = extractor
+        self.preprocessor = preprocessor
+        self.danger_evaluator = danger_evaluator
+        self.desc_generator = desc_generator
+        self.extras_manager = extras_manager
+        self.knowledge_manager = knowledge_manager
+        self.vr_integration = vr_integration
+        self.images_path = images_path
+        self.df_pokemon = df_pokemon  # Almacenar el DataFrame
+
+        # Inicializar el simulador de batallas
+        self.battle_simulator = BattleSimulator()
+
+        # Asignar el DataFrame a una variable local
+        self.pokemon_data = self.df_pokemon
+
+        # Lista para almacenar la colección de Pokémon
+        self.team = []
+
+        # Configurar la barra de título y el tamaño de la ventana
+        self.master.title("Reconocedor de Pokémon - Sistemas Inteligentes")
+        self.master.geometry("1200x800")  # Ajustar tamaño inicial de la ventana
+
+        # Crear Canvas y Scrollbar para la interfaz principal
+        self.canvas = tk.Canvas(self.master, borderwidth=0, background="#f0f0f0")
+        self.frame = tk.Frame(self.canvas, background="#f0f0f0")
+        self.vsb = tk.Scrollbar(self.master, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.vsb.set)
+
+        self.vsb.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.canvas.create_window((0, 0), window=self.frame, anchor="nw",
+                                  tags="self.frame")
+
+        self.frame.bind("<Configure>", self.onFrameConfigure)
+
+        # Crear los widgets dentro de self.frame en lugar de self
+        self.create_widgets()
+
+    def onFrameConfigure(self, event):
+        '''Reset the scroll region to encompass the inner frame'''
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def create_widgets(self):
+        # Sección de Cargar Imagen y Información
+        info_frame = tk.Frame(self.frame, background="#f0f0f0")
+        info_frame.pack(side=tk.TOP, fill=tk.X, pady=10, padx=10)
+
+        # Botón de Cargar Imagen
+        self.load_button = tk.Button(info_frame, text="Cargar Imagen de Pokémon", command=self.load_image, width=25, height=2)
+        self.load_button.pack(side=tk.LEFT, padx=5)
+
+        # Botón para ver el mapa de hábitat
+        self.map_button = tk.Button(info_frame, text="Ver Mapa de Hábitat", command=self.view_habitat_map, width=20, height=2)
+        self.map_button.pack(side=tk.LEFT, padx=5)
+
+        # Botón para simular batalla
+        self.battle_button = tk.Button(info_frame, text="Simular Batalla", command=self.simulate_battle, width=20, height=2)
+        self.battle_button.pack(side=tk.LEFT, padx=5)
+
+        # Sección de Información del Pokémon
+        info_text_frame = tk.Frame(self.frame, background="#f0f0f0")
+        info_text_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=10, padx=10)
+
+        self.info_label = tk.Label(info_text_frame, text="Información del Pokémon:", font=("Arial", 14), background="#f0f0f0")
+        self.info_label.pack(anchor='w')
+
+        self.info_text = tk.Text(info_text_frame, height=15, width=100, wrap=tk.WORD)
+        self.info_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0,5))
+
+        # Scrollbar para el cuadro de información
+        info_scrollbar = tk.Scrollbar(info_text_frame, command=self.info_text.yview)
+        info_scrollbar.pack(side=tk.LEFT, fill=tk.Y)
+        self.info_text.configure(yscrollcommand=info_scrollbar.set)
+
+        # Sección de Recomendaciones y Noticias
+        recommendations_news_frame = tk.Frame(self.frame, background="#f0f0f0")
+        recommendations_news_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=10, padx=10)
+
+        # Recomendaciones
+        rec_frame = tk.Frame(recommendations_news_frame, background="#f0f0f0")
+        rec_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5)
+
+        self.recommendations_label = tk.Label(rec_frame, text="Recomendaciones similares:", font=("Arial", 14), background="#f0f0f0")
+        self.recommendations_label.pack(anchor='w')
+
+        self.recommendations_box = tk.Listbox(rec_frame, width=40, height=10)
+        self.recommendations_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # Scrollbar para recomendaciones
+        rec_scrollbar = tk.Scrollbar(rec_frame, command=self.recommendations_box.yview)
+        rec_scrollbar.pack(side=tk.LEFT, fill=tk.Y)
+        self.recommendations_box.configure(yscrollcommand=rec_scrollbar.set)
+
+        # Noticias
+        news_frame = tk.Frame(recommendations_news_frame, background="#f0f0f0")
+        news_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5)
+
+        self.news_label = tk.Label(news_frame, text="Noticias:", font=("Arial", 14), background="#f0f0f0")
+        self.news_label.pack(anchor='w')
+
+        self.news_box = tk.Listbox(news_frame, width=40, height=10)
+        self.news_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # Scrollbar para noticias
+        news_scrollbar = tk.Scrollbar(news_frame, command=self.news_box.yview)
+        news_scrollbar.pack(side=tk.LEFT, fill=tk.Y)
+        self.news_box.configure(yscrollcommand=news_scrollbar.set)
+
+        # Sección de Preguntas (Chat simple)
+        chat_frame = tk.Frame(self.frame, background="#f0f0f0")
+        chat_frame.pack(side=tk.TOP, fill=tk.X, pady=10, padx=10)
+
+        self.question_label = tk.Label(chat_frame, text="Haz una pregunta sobre Pokémon o el sistema inteligente:",
+                                       font=("Arial", 14), background="#f0f0f0")
+        self.question_label.pack(anchor='w')
+
+        self.question_entry = tk.Entry(chat_frame, width=80)
+        self.question_entry.pack(side=tk.LEFT, padx=(0,5), pady=5)
+
+        self.ask_button = tk.Button(chat_frame, text="Preguntar", command=self.ask_question, width=10)
+        self.ask_button.pack(side=tk.LEFT, padx=5)
+
+        # Sección de Instrucciones para la Batalla
+        battle_instructions_frame = tk.Frame(self.frame, background="#f0f0f0")
+        battle_instructions_frame.pack(side=tk.TOP, fill=tk.X, pady=5, padx=10)
+
+        battle_instructions_label = tk.Label(
+            battle_instructions_frame,
+            text="Selecciona exactamente dos Pokémon en la colección para simular una batalla.\n"
+                 "Usa Shift + Click para seleccionar un rango o Ctrl + Click para selecciones individuales.",
+            font=("Arial", 10),
+            justify=tk.LEFT,
+            background="#f0f0f0"
+        )
+        battle_instructions_label.pack(anchor='w')
+
+        # Botón para integrar con entorno virtual
+        vr_frame = tk.Frame(self.frame, background="#f0f0f0")
+        vr_frame.pack(side=tk.TOP, fill=tk.X, pady=10, padx=10)
+
+        self.vr_button = tk.Button(vr_frame, text="Colocar Pokémon en entorno virtual 3D", command=self.place_in_vr, width=35, height=2)
+        self.vr_button.pack()
+
+        # Sección de Colección de Pokémon
+        collection_frame = tk.Frame(self.frame, borderwidth=2, relief=tk.GROOVE, background="#f0f0f0")
+        collection_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=10, padx=10)
+
+        self.collection_label = tk.Label(collection_frame, text="Colección de Pokémon:", font=("Arial", 14), background="#f0f0f0")
+        self.collection_label.pack(anchor='w')
+
+        # Aumentar el tamaño del Listbox de la colección y permitir selección múltiple
+        self.team_box = tk.Listbox(collection_frame, width=50, height=15, selectmode='extended')
+        self.team_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0,5), pady=5)
+
+        # Scrollbar para la colección
+        team_scrollbar = tk.Scrollbar(collection_frame, command=self.team_box.yview)
+        team_scrollbar.pack(side=tk.LEFT, fill=tk.Y)
+        self.team_box.configure(yscrollcommand=team_scrollbar.set)
+
+        # Botón para eliminar Pokémon de la colección
+        remove_button = tk.Button(collection_frame, text="Eliminar Pokémon", command=self.remove_pokemon, width=15)
+        remove_button.pack(side=tk.LEFT, padx=5, pady=5)
+
+    def load_image(self):
+        file_path = filedialog.askopenfilename(
+            initialdir=self.images_path,
+            title="Seleccione una imagen",
+            filetypes=(("Imagenes", "*.png;*.jpg;*.jpeg"), ("Todos los archivos", "*.*"))
+        )
+        if file_path:
+            try:
+                img_processed = self.preprocessor.preprocess(file_path)
+                features = self.extractor.extract_features(img_processed)
+                predicted_pokedex = self.classifier.predict(features)
+
+                # Calcular peligrosidad borrosa
+                poke_data = self.df_pokemon[self.df_pokemon['pokedex_number'] == predicted_pokedex].iloc[0]
+                attack_val = poke_data['attack']
+                defense_val = poke_data['defense']
+                speed_val = poke_data['speed']
+                hp_val = poke_data['hp']
+                danger_score = self.danger_evaluator.evaluate(attack_val, defense_val)
+
+                description = self.desc_generator.generate_description(predicted_pokedex, danger_score)
+                self.info_text.delete('1.0', tk.END)
+                self.info_text.insert(tk.END, description)
+
+                # Recomendaciones
+                recs = self.extras_manager.get_recommendations(predicted_pokedex)
+                self.recommendations_box.delete(0, tk.END)
+                for r in recs:
+                    self.recommendations_box.insert(tk.END, r)
+
+                # Noticias
+                news = self.extras_manager.get_news()
+                self.news_box.delete(0, tk.END)
+                for n in news:
+                    self.news_box.insert(tk.END, n)
+
+                # Guardar pokedex_number actual para VR y Mapa
+                self.current_pokedex = predicted_pokedex
+
+                # Añadir el Pokémon a la colección
+                pokemon_entry = f"{poke_data['name']} (N.° {predicted_pokedex})"
+                self.team_box.insert(tk.END, pokemon_entry)
+                self.team.append(predicted_pokedex)
+
+            except Exception as e:
+                messagebox.showerror("Error", str(e))
+
+    def remove_pokemon(self):
+        selected_indices = self.team_box.curselection()
+        if not selected_indices:
+            messagebox.showwarning("Atención", "Por favor, selecciona al menos un Pokémon para eliminar.")
+            return
+
+        for index in reversed(selected_indices):
+            self.team_box.delete(index)
+            del self.team[index]
+
+    def ask_question(self):
+        question = self.question_entry.get()
+        if question.strip():
+            answer = self.knowledge_manager.answer_question(question)
+            messagebox.showinfo("Respuesta", answer)
+        else:
+            messagebox.showwarning("Atención", "Por favor, introduce una pregunta.")
+
+    def place_in_vr(self):
+        if hasattr(self, 'current_pokedex'):
+            result = self.vr_integration.place_pokemon_in_virtual_world(self.current_pokedex)
+            messagebox.showinfo("Entorno Virtual", result)
+        else:
+            messagebox.showwarning("Atención", "Primero debes reconocer un Pokémon.")
+
+    def view_habitat_map(self):
+        if hasattr(self, 'current_pokedex'):
+            try:
+                # Obtener la ruta del archivo HTML del mapa
+                map_file = self.extras_manager.get_habitat_map(self.current_pokedex)
+
+                # Abrir el mapa en el navegador predeterminado
+                webbrowser.open(f'file:///{map_file}')
+
+            except Exception as e:
+                messagebox.showerror("Error al generar el mapa", str(e))
+        else:
+            messagebox.showwarning("Atención", "Primero debes reconocer un Pokémon.")
+
+    def simulate_battle(self):
+        selected_indices = self.team_box.curselection()
+        if len(selected_indices) != 2:
+            messagebox.showwarning("Atención", "Por favor, selecciona exactamente dos Pokémon para la batalla.")
+            return
+
+        pokedex1 = self.team[selected_indices[0]]
+        pokedex2 = self.team[selected_indices[1]]
+
+        # Obtener los datos de ambos Pokémon
+        poke1_data = self.pokemon_data[self.pokemon_data['pokedex_number'] == pokedex1].iloc[0]
+        poke2_data = self.pokemon_data[self.pokemon_data['pokedex_number'] == pokedex2].iloc[0]
+
+        # Crear diccionarios con las estadísticas necesarias
+        pokemon1 = {
+            'name': poke1_data['name'],
+            'hp': poke1_data['hp'],
+            'attack': poke1_data['attack'],
+            'defense': poke1_data['defense'],
+            'speed': poke1_data['speed']
+        }
+
+        pokemon2 = {
+            'name': poke2_data['name'],
+            'hp': poke2_data['hp'],
+            'attack': poke2_data['attack'],
+            'defense': poke2_data['defense'],
+            'speed': poke2_data['speed']
+        }
+
+        # Simular la batalla
+        result = self.battle_simulator.simulate_battle(pokemon1, pokemon2)
+
+        # Mostrar el resultado en una ventana emergente
+        battle_window = tk.Toplevel(self.master)
+        battle_window.title("Resultado de la Batalla")
+        battle_window.geometry("600x400")
+
+        result_label = tk.Label(battle_window, text=f"¡{result['winner']} ha ganado la batalla!", font=("Arial", 16, "bold"))
+        result_label.pack(pady=10)
+
+        battle_log_text = tk.Text(battle_window, wrap=tk.WORD, height=20, width=70)
+        battle_log_text.pack(padx=10, pady=10, fill=tk.BOTH, expand=True)
+        battle_log_text.insert(tk.END, result['log'])
+        battle_log_text.configure(state='disabled')  # Hacer el texto de solo lectura
+
+        # Botón para cerrar la ventana de batalla
+        close_button = tk.Button(battle_window, text="Cerrar", command=battle_window.destroy, width=10)
+        close_button.pack(pady=10)
+
+
+===== [Fichero] src/image_processing.py (Preprocesamiento de imágenes con OpenCV) =====
+
+# src/image_processing.py
+
+import cv2
+import numpy as np
+
+
+class ImagePreprocessor:
+    def __init__(self):
+        pass
+
+    def preprocess(self, image_path):
+        """
+        Preprocesamiento de la imagen (Percepción Computacional: Preproceso, Segmentación).
+
+        Args:
+            image_path (str): Ruta a la imagen a preprocesar.
+
+        Returns:
+            np.ndarray: Imagen preprocesada.
+        """
+        img = cv2.imread(image_path)
+        if img is None:
+            raise FileNotFoundError(f"No se encontró la imagen en {image_path}")
+
+        # Cambio de tamaño a 128x128
+        img = cv2.resize(img, (128, 128))
+        # Normalización
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img = img / 255.0
+        return img
+
+
+===== [Fichero] src/optimization.py (Algoritmo genético (DEAP) para optimizar el SVM) =====
+
+# Ejemplo uso de Algoritmos Genéticos (Computación Evolutiva) para optimizar SVM (placeholder)
+from deap import base, creator, tools
+import random
+import numpy as np
+from sklearn.svm import SVC
+from sklearn.model_selection import cross_val_score
+
+def evaluate_params(individual, X, y):
+    C = individual[0]
+    gamma = individual[1]
+    model = SVC(C=C, gamma=gamma)
+    scores = cross_val_score(model, X, y, cv=3)
+    return (scores.mean(),)
+
+def optimize_hyperparameters(classifier, df):
+    # Placeholder: sin datos reales, usamos datos aleatorios
+    X = np.random.rand(100, 50)
+    y = np.random.randint(1, 152, 100)
+
+    creator.create("FitnessMax", base.Fitness, weights=(1.0,))
+    creator.create("Individual", list, fitness=creator.FitnessMax)
+    toolbox = base.Toolbox()
+    toolbox.register("C", random.uniform, 0.1, 10.0)
+    toolbox.register("gamma", random.uniform, 0.0001, 0.1)
+    toolbox.register("individual", tools.initCycle, creator.Individual, (toolbox.C, toolbox.gamma), n=1)
+    toolbox.register("population", tools.initRepeat, list, toolbox.individual)
+
+    toolbox.register("evaluate", evaluate_params, X=X, y=y)
+    toolbox.register("mate", tools.cxTwoPoint)
+    toolbox.register("mutate", tools.mutGaussian, mu=0, sigma=1, indpb=0.1)
+    toolbox.register("select", tools.selTournament, tournsize=3)
+
+    pop = toolbox.population(n=10)
+    for gen in range(5):
+        offspring = tools.selTournament(pop, len(pop), tournsize=3)
+        offspring = list(map(toolbox.clone, offspring))
+        for child1, child2 in zip(offspring[::2], offspring[1::2]):
+            if random.random() < 0.7:
+                tools.cxTwoPoint(child1, child2)
+            if random.random() < 0.2:
+                tools.mutGaussian(child1, mu=0, sigma=1, indpb=0.1)
+                tools.mutGaussian(child2, mu=0, sigma=1, indpb=0.1)
+            del child1.fitness.values, child2.fitness.values
+        fits = list(map(toolbox.evaluate, offspring))
+        for fit, ind in zip(fits, offspring):
+            ind.fitness.values = fit
+        pop = tools.selBest(offspring+pop, k=10)
+
+    best = tools.selBest(pop, k=1)[0]
+    C_best, gamma_best = best
+    classifier.model = SVC(C=C_best, gamma=gamma_best, probability=True)
+
+
